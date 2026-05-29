@@ -1,6 +1,6 @@
 # backend/api/progression/mongo_models.py
 import mongoengine as me
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 class StudentProfileDocument(me.Document):
     student_id      = me.StringField(
@@ -36,6 +36,30 @@ class StudentProfileDocument(me.Document):
             self.save()
 
     def increment_streak(self):
-        self.streak_count += 1
-        self.last_active   = datetime.utcnow()
+        now      = datetime.now(timezone.utc)
+        today    = now.date()
+        last     = self.last_active
+
+        # Make last_active timezone-aware if stored naive
+        if last and last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+
+        if last:
+            last_date = last.date()
+            if last_date == today:
+                # Already counted today — update
+                # timestamp but don't increment
+                self.last_active = now
+                self.save()
+                return
+            elif last_date == today - timedelta(days=1):
+                # Consecutive day — extend streak
+                self.streak_count += 1
+            else:
+                # Missed a day — reset streak to 1
+                self.streak_count = 1
+        else:
+            self.streak_count = 1
+
+        self.last_active = now
         self.save()
