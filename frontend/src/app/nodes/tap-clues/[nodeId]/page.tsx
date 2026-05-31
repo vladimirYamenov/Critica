@@ -6,6 +6,10 @@ import {
 } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { apiFetch } from '@/lib/api'
+import {
+  buildSessionQueue, saveSession, loadSession, clearSession,
+  nodeDifficulty, DIFFICULTY_LABELS, DIFFICULTY_COLORS,
+} from '@/lib/nodeSession'
 
 // ── Types ──────────────────────────────────────
 interface LockedWordMeta {
@@ -18,6 +22,7 @@ interface TapNodeData {
   node_id:            string
   title:              string
   focus:              string
+  difficulty:         number
   micro_lesson_text:  string
   reading_passage:    string
   deep_dive_required: boolean
@@ -482,6 +487,38 @@ export default function TapCluesPage() {
   const [pulseClue,      setPulseClue]      = useState<string | null>(null)
   const [masteryData,    setMasteryData]    = useState<any>(null)
   const [submitting,     setSubmitting]     = useState(false)
+  const [wrongs,         setWrongs]         = useState(0)
+
+  // session state
+  const [sessionQueue,   setSessionQueue]   = useState<string[]>([])
+  const [questionIndex,  setQuestionIndex]  = useState(0)
+  const [sessionStartId, setSessionStartId] = useState<string | null>(null)
+  const [savedNextNode,  setSavedNextNode]  = useState<string | null>(null)
+  const [savedStreak,    setSavedStreak]    = useState<number | null>(null)
+
+  // ── Load a question inline ──────────────────
+  const loadQuestion = useCallback(async (targetNodeId: string) => {
+    setPhase('loading')
+    try {
+      const d = await apiFetch(`/nodes/tap-clues/${targetNodeId}/`)
+      setTapNode(d)
+      setActiveWordId(null)
+      setFoundClues({})
+      setUnlockedWords([])
+      setDefPanel(null)
+      setPulseClue(null)
+      setWrongs(0)
+      setFbText('')
+      setDrawer(false)
+      setHintOverlay(false)
+      setHintOverlayText('')
+      setHintOverlayTier(0)
+      setPhase('task')
+    } catch (e: any) {
+      setErrorMsg(e?.error ?? 'Failed to load next question.')
+      setPhase('error')
+    }
+  }, [])
 
   const [fbText,        setFbText]        = useState('')
   const [drawer,        setDrawer]        = useState(false)
@@ -497,18 +534,58 @@ export default function TapCluesPage() {
 
   // ── Load node ──────────────────────────────
   useEffect(() => {
-    apiFetch(`/nodes/tap-clues/${nodeId}/`)
-      .then((d: TapNodeData) => {
-        setTapNode(d)
-        setPhase('micro_lesson')
-      })
-      .catch((e: any) => {
-        if (e?.status === 401)              { router.push('/auth');      return }
-        if (e?.error === 'Node is locked.') { router.push('/dashboard'); return }
-        setErrorMsg(e?.error ?? 'Failed to load node.')
-        setPhase('error')
-      })
-  }, [nodeId]) // eslint-disable-line
+    const start = nodeId
+    setSessionStartId(start)
+    const saved = loadSession('tap_clues', start)
+
+    if (saved && saved.sessionQueue.length === 5) {
+      setSessionQueue(saved.sessionQueue)
+      setQuestionIndex(saved.questionIndex)
+      if (saved.next_node) setSavedNextNode(saved.next_node)
+      if (saved.streak !== undefined) setSavedStreak(saved.streak)
+
+      const activeId = saved.sessionQueue[saved.questionIndex] ?? start
+      apiFetch(`/nodes/tap-clues/${activeId}/`)
+        .then((d: TapNodeData) => {
+          setTapNode(d)
+          setPhase('task')
+        })
+        .catch((e: any) => {
+          if (e?.status === 401)              { router.push('/auth');      return }
+          if (e?.error === 'Node is locked.') { router.push('/dashboard'); return }
+          setErrorMsg(e?.error ?? 'Failed to load node.')
+          setPhase('error')
+        })
+    } else {
+      apiFetch(`/nodes/tap-clues/${start}/`)
+        .then((d: TapNodeData) => {
+          setTapNode(d)
+          setPhase('micro_lesson')
+
+          apiFetch('/progression/dashboard/')
+            .then((prog: any) => {
+              const unlocked: string[] = prog.unlocked_nodes ?? []
+              const queue = buildSessionQueue('tap_clues', start, unlocked)
+              setSessionQueue(queue)
+              setQuestionIndex(0)
+              saveSession('tap_clues', start, {
+                sessionQueue: queue,
+                questionIndex: 0,
+              })
+            })
+            .catch(() => {
+              setSessionQueue([start])
+              setQuestionIndex(0)
+            })
+        })
+        .catch((e: any) => {
+          if (e?.status === 401)              { router.push('/auth');      return }
+          if (e?.error === 'Node is locked.') { router.push('/dashboard'); return }
+          setErrorMsg(e?.error ?? 'Failed to load node.')
+          setPhase('error')
+        })
+    }
+  }, [nodeId, router])
 
   useEffect(() => {
     if (phase !== 'task' || nodeId !== 'tap_node_01') return
@@ -521,32 +598,15 @@ export default function TapCluesPage() {
     setTutorialOpen(true)
   }, [phase, nodeId])
 
-  // ── Timer ──────────────────────────────────
-  const resetTimer = useCallback(() => {
-    inactiveRef.current = 0
-    if (timerRef.current) clearInterval(timerRef.current)
-    timerRef.current = setInterval(() => {
-      inactiveRef.current += 1
-      if (inactiveRef.current >= 60) {
-        clearInterval(timerRef.current!)
-        fetchHint(true)
-      }
-    }, 1000)
-  }, [nodeId]) // eslint-disable-line
-
-  useEffect(() => {
-    if (phase === 'task') resetTimer()
-    return () => { if (timerRef.current) clearInterval(timerRef.current) }
-  }, [phase]) // eslint-disable-line
-
   // ── Fetch feedback ─────────────────────────
   const callFeedback = useCallback(async (
     word_id:    string,
     clue_word:  string,
     inactivity: boolean,
   ) => {
+    const activeNodeId = tapNode?.node_id ?? nodeId
     try {
-      const res = await apiFetch(`/nodes/tap-clues/${nodeId}/feedback/`, {
+      const res = await apiFetch(`/nodes/tap-clues/${activeNodeId}/feedback/`, {
         method: 'POST',
         body: JSON.stringify({
           word_id,
@@ -560,12 +620,13 @@ export default function TapCluesPage() {
       setFbText('That word is not a valid context clue. Look for synonyms or definitions nearby.')
       setDrawer(true)
     }
-  }, [nodeId])
+  }, [nodeId, tapNode])
 
   // ── Fetch hint ─────────────────────────────
   const fetchHint = useCallback(async (isInactivity = false) => {
+    const activeNodeId = tapNode?.node_id ?? nodeId
     try {
-      const res = await apiFetch(`/nodes/tap-clues/${nodeId}/feedback/`, {
+      const res = await apiFetch(`/nodes/tap-clues/${activeNodeId}/feedback/`, {
         method: 'POST',
         body: JSON.stringify({
           word_id:            activeWordId ?? '',
@@ -581,7 +642,25 @@ export default function TapCluesPage() {
       setHintOverlayText('Look for words near the locked word that hint at its meaning.')
       setHintOverlay(true)
     }
-  }, [nodeId, activeWordId])
+  }, [nodeId, activeWordId, tapNode])
+
+  // ── Timer ──────────────────────────────────
+  const resetTimer = useCallback(() => {
+    inactiveRef.current = 0
+    if (timerRef.current) clearInterval(timerRef.current)
+    timerRef.current = setInterval(() => {
+      inactiveRef.current += 1
+      if (inactiveRef.current >= 60) {
+        clearInterval(timerRef.current!)
+        fetchHint(true)
+      }
+    }, 1000)
+  }, [fetchHint])
+
+  useEffect(() => {
+    if (phase === 'task') resetTimer()
+    return () => { if (timerRef.current) clearInterval(timerRef.current) }
+  }, [phase, resetTimer])
 
   // ── Log word to lexical deck ───────────────
   const logWordToLexical = useCallback(async (
@@ -590,18 +669,19 @@ export default function TapCluesPage() {
     contextual_usage: string,
     translation:      string,
   ) => {
+    const activeNodeId = tapNode?.node_id ?? nodeId
     try {
       await apiFetch('/lexical/log/', {
         method: 'POST',
         body: JSON.stringify({
           word_data: { word, definition, contextual_usage, translation },
-          task_id: nodeId,
+          task_id: activeNodeId,
         }),
       })
     } catch {
       console.warn('Lexical log failed silently')
     }
-  }, [nodeId])
+  }, [nodeId, tapNode])
 
   // ── Handle tap on a word span ──────────────
   const handleWordTap = async (
@@ -635,7 +715,7 @@ export default function TapCluesPage() {
       const currentFound = foundClues[activeWordId] ?? []
 
       try {
-        const res = await apiFetch(`/nodes/tap-clues/${nodeId}/evaluate-clue/`, {
+        const res = await apiFetch(`/nodes/tap-clues/${tapNode.node_id}/evaluate-clue/`, {
           method: 'POST',
           body: JSON.stringify({
             word_id:     activeWordId,
@@ -664,7 +744,10 @@ export default function TapCluesPage() {
             setFoundClues(prev => ({ ...prev, [activeWordId]: res.found_clues }))
           }
         } else {
+          const nextWrongs = wrongs + 1
+          setWrongs(nextWrongs)
           await callFeedback(activeWordId, cleanWord, false)
+          if (nextWrongs >= 3) fetchHint()
         }
       } catch {
         setErrorMsg('Evaluation failed.')
@@ -677,13 +760,54 @@ export default function TapCluesPage() {
     if (!tapNode || submitting) return
     setSubmitting(true)
     try {
-      const res = await apiFetch(`/nodes/tap-clues/${nodeId}/mastery/`, {
+      const res = await apiFetch(`/nodes/tap-clues/${tapNode.node_id}/mastery/`, {
         method: 'POST',
-        body: JSON.stringify({ unlocked_word_ids: unlockedWords }),
+        body: JSON.stringify({
+          unlocked_word_ids: unlockedWords,
+          save_progression: false,
+        }),
       })
       if (res.status === 'mastered') {
-        setMasteryData(res)
-        setPhase('mastery')
+        const nextIdx = questionIndex + 1
+
+        if (nextIdx < sessionQueue.length) {
+          const newNextNode = savedNextNode
+          const newStreak = savedStreak
+
+          if (sessionStartId) {
+            saveSession('tap_clues', sessionStartId, {
+              sessionQueue,
+              questionIndex: nextIdx,
+              next_node: newNextNode || undefined,
+              streak: newStreak !== null ? newStreak : undefined,
+            })
+          }
+          setQuestionIndex(nextIdx)
+          loadQuestion(sessionQueue[nextIdx])
+        } else {
+          let finalRes = res
+          if (sessionStartId) {
+            finalRes = await apiFetch(
+              `/nodes/tap-clues/${sessionStartId}/mastery/`,
+              {
+                method: 'POST',
+                body: JSON.stringify({
+                  commit_only: true,
+                }),
+              },
+            )
+          }
+
+          const newNextNode = savedNextNode || finalRes.next_node
+          const newStreak = savedStreak !== null ? savedStreak : (finalRes.streak ?? null)
+
+          if (sessionStartId) clearSession('tap_clues', sessionStartId)
+          setMasteryData({
+            next_node: newNextNode,
+            streak: newStreak,
+          })
+          setPhase('mastery')
+        }
       }
     } catch (e: any) {
       setFbText(
@@ -763,7 +887,17 @@ export default function TapCluesPage() {
           </button>
           <button
             title="End session"
-            onClick={() => router.push('/dashboard')}
+            onClick={() => {
+              if (sessionStartId && sessionQueue.length > 0) {
+                saveSession('tap_clues', sessionStartId, {
+                  sessionQueue,
+                  questionIndex,
+                  next_node: savedNextNode || undefined,
+                  streak: savedStreak !== null ? savedStreak : undefined,
+                })
+              }
+              router.push('/dashboard')
+            }}
             style={{
               writingMode: 'vertical-rl',
               transform: 'rotate(180deg)',
@@ -802,6 +936,33 @@ export default function TapCluesPage() {
                 TAP THE LOCKED WORDS, THEN TAP SURROUNDING CLUE WORDS TO UNLOCK THEIR MEANING
               </span>
             </div>
+          </div>
+
+          {/* difficulty badge + Q counter */}
+          <div style={{ padding: '6px 24px 6px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: DIFFICULTY_COLORS[tapNode!.difficulty ?? nodeDifficulty(nodeId)], flexShrink: 0 }} />
+                <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.12em', color: DIFFICULTY_COLORS[tapNode!.difficulty ?? nodeDifficulty(nodeId)], fontFamily: FONT }}>
+                  LVL {tapNode!.difficulty ?? nodeDifficulty(nodeId)} — {DIFFICULTY_LABELS[tapNode!.difficulty ?? nodeDifficulty(nodeId)]}
+                </span>
+              </div>
+              {sessionQueue.length > 0 && (
+                <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.1em', color: '#555', fontFamily: FONT }}>
+                  Q {questionIndex + 1} / {sessionQueue.length}
+                </span>
+              )}
+            </div>
+            {sessionQueue.length > 0 && (
+              <div style={{ height: 6, background: '#e0ddd8', borderRadius: 3, overflow: 'hidden', position: 'relative', border: '1px solid #aaa' }}>
+                <div style={{
+                  height: '100%',
+                  width: `${(questionIndex / sessionQueue.length) * 100}%`,
+                  background: '#2b2b2b',
+                  transition: 'width 0.3s ease-in-out'
+                }} />
+              </div>
+            )}
           </div>
 
           {/* ── WORD PROGRESS DOTS ── */}

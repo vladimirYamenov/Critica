@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useRouter }           from 'next/navigation'
 import { apiFetch }            from '@/lib/api'
 
@@ -351,41 +351,40 @@ export default function StudentDashboard() {
   const [scrollPos, setScrollPos] = useState(0)
   const [showMenu, setShowMenu]   = useState(false)
 
-  // ── Fetch dashboard on mount ──────────────
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const d = await apiFetch(
-          '/progression/dashboard/')
-        setDashboard(d)
-      } catch (e: any) {
-        const code =
-          e?.code ?? e?.detail?.code ?? ''
-        const detail =
-          typeof e?.detail === 'string'
-            ? e.detail
-            : e?.detail?.detail ?? ''
+  // ── Fetch dashboard ───────────────────────
+  const fetchDashboard = useCallback(async () => {
+    try {
+      const d = await apiFetch('/progression/dashboard/')
+      setDashboard(d)
+    } catch (e: any) {
+      const code =
+        e?.code ?? e?.detail?.code ?? ''
+      const detail =
+        typeof e?.detail === 'string'
+          ? e.detail
+          : e?.detail?.detail ?? ''
 
-        const isAuthError =
-          e?.status === 401 ||
-          code === 'token_not_valid' ||
-          detail.includes('token') ||
-          detail.includes('expired')
+      const isAuthError =
+        e?.status === 401 ||
+        code === 'token_not_valid' ||
+        detail.includes('token') ||
+        detail.includes('expired')
 
-        if (isAuthError) {
-          localStorage.removeItem('accessToken')
-          localStorage.removeItem('refreshToken')
-          localStorage.removeItem('user')
-          router.push('/auth')
-        } else {
-          setError('Could not load dashboard.')
-        }
-      } finally {
-        setLoading(false)
+      if (isAuthError) {
+        localStorage.removeItem('accessToken')
+        localStorage.removeItem('refreshToken')
+        localStorage.removeItem('user')
+        router.push('/auth')
+      } else {
+        setError('Could not load dashboard.')
       }
     }
-    load()
-  }, [])
+  }, [router])
+
+  useEffect(() => {
+    setLoading(true)
+    fetchDashboard().finally(() => setLoading(false))
+  }, [fetchDashboard])
 
   // ── Logout ────────────────────────────────
   const handleLogout = () => {
@@ -403,6 +402,61 @@ export default function StudentDashboard() {
   ) => {
     if (nodeStatus === 'locked') return
     router.push(`${route_base}/${node_id}`)
+  }
+
+  // ── Reset node ────────────────────────────
+  const handleResetNode = async (nodeId: string) => {
+    let module = ''
+    if (nodeId.startsWith('log_')) module = 'logic_thread'
+    else if (nodeId.startsWith('snp_')) module = 'snap_gap'
+    else if (nodeId.startsWith('tap_')) module = 'tap_clues'
+    else if (nodeId.startsWith('fac_')) module = 'fact_scanner'
+
+    if (!module) return
+
+    localStorage.removeItem(`critica_session__${module}__${nodeId}`)
+
+    try {
+      await apiFetch('/progression/reset/', {
+        method: 'POST',
+        body: JSON.stringify({ node_id: nodeId }),
+      })
+      await fetchDashboard()
+    } catch {
+      console.warn('Failed to reset node on backend')
+      await fetchDashboard()
+    }
+  }
+
+  // ── Get node progress percentage ──────────
+  const getNodeProgress = (nodeId: string): number => {
+    if (!dashboard) return 0
+    const activeNodes = getActiveNodes()
+    const found = activeNodes.find(n => n.node_id === nodeId)
+    if (found?.status === 'completed') {
+      return 100
+    }
+
+    let module = ''
+    if (nodeId.startsWith('log_')) module = 'logic_thread'
+    else if (nodeId.startsWith('snp_')) module = 'snap_gap'
+    else if (nodeId.startsWith('tap_')) module = 'tap_clues'
+    else if (nodeId.startsWith('fac_')) module = 'fact_scanner'
+
+    if (!module) return 0
+
+    try {
+      const raw = localStorage.getItem(`critica_session__${module}__${nodeId}`)
+      if (raw) {
+        const data = JSON.parse(raw)
+        const qIndex = data.questionIndex ?? 0
+        const queueLen = data.sessionQueue?.length ?? 5
+        if (queueLen > 0) {
+          return Math.round((qIndex / queueLen) * 100)
+        }
+      }
+    } catch { /* ignore */ }
+    return 0
   }
 
   // ── Get nodes for active tab ──────────────
@@ -702,9 +756,7 @@ export default function StudentDashboard() {
                               bg-[#222] rounded-sm
                               transition-all"
                             style={{
-                              width: isDone
-                                ? '100%'
-                                : '0%',
+                              width: `${getNodeProgress(node.node_id)}%`,
                             }} />
                         </div>
 
@@ -715,41 +767,57 @@ export default function StudentDashboard() {
                             text-[10px] text-[#555]
                             leading-6">
                             PROGRESS —{' '}
-                            {isDone ? '100' : '0'}%
+                            {getNodeProgress(node.node_id)}%
                             <br />
                             {node.node_id
                               .toUpperCase()}
                           </div>
 
-                          <button
-                            disabled={isLocked}
-                            onClick={() =>
-                              handleStartNode(
-                                activeTabCfg
-                                  .route_base,
-                                node.node_id,
-                                node.status,
-                              )
-                            }
-                            className={`font-mono
-                              text-xs font-bold
-                              uppercase tracking-wider
-                              text-center px-4
-                              py-[9px] border-[1.5px]
-                              border-[#888] leading-snug
-                              flex-shrink-0
-                              whitespace-nowrap
-                              transition-all
-                              ${isLocked
-                                ? 'bg-[#ccc] text-[#999] cursor-not-allowed'
-                                : 'bg-[#d8d4cc] text-[#111] cursor-pointer hover:bg-[#111] hover:text-[#eee]'
-                              }`}>
-                            {isDone
-                              ? 'REVIEW\nNODE'
-                              : isLocked
-                              ? 'LOCKED'
-                              : 'PULL PAPER &\nSTART TRAINING'}
-                          </button>
+                          <div className="flex gap-2 items-center">
+                            {!isDone && getNodeProgress(node.node_id) > 0 && (
+                              <button
+                                onClick={() => handleResetNode(node.node_id)}
+                                className="font-mono text-xs font-bold uppercase tracking-wider text-center px-3 py-[9px] border-[1.5px] border-red-800 text-red-800 hover:bg-red-800 hover:text-white transition-all cursor-pointer"
+                              >
+                                RESET
+                              </button>
+                            )}
+                            <button
+                              disabled={isLocked}
+                              onClick={() => {
+                                if (isDone) {
+                                  handleResetNode(node.node_id)
+                                } else {
+                                  handleStartNode(
+                                    activeTabCfg.route_base,
+                                    node.node_id,
+                                    node.status,
+                                  )
+                                }
+                              }}
+                              className={`font-mono
+                                text-xs font-bold
+                                uppercase tracking-wider
+                                text-center px-4
+                                py-[9px] border-[1.5px]
+                                border-[#888] leading-snug
+                                flex-shrink-0
+                                whitespace-nowrap
+                                transition-all
+                                ${isLocked
+                                  ? 'bg-[#ccc] text-[#999] cursor-not-allowed'
+                                  : 'bg-[#d8d4cc] text-[#111] cursor-pointer hover:bg-[#111] hover:text-[#eee]'
+                                }`}
+                            >
+                               {isDone
+                                 ? 'RESET NODE'
+                                 : isLocked
+                                 ? 'LOCKED'
+                                 : getNodeProgress(node.node_id) > 0
+                                 ? 'CONTINUE TRAINING'
+                                 : 'PULL PAPER & START TRAINING'}
+                            </button>
+                          </div>
                         </div>
 
                         {/* Completed stamp */}

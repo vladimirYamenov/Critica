@@ -10,6 +10,18 @@ from api.scaffold.scaffold_service import (
 from .mongo_models import LogicThreadNodeDocument
 
 
+def _node_difficulty(node_id: str) -> int:
+    try:
+        num = int(node_id.split('_')[-1])
+    except (ValueError, IndexError):
+        return 1
+    if num <= 2:  return 1
+    if num <= 5:  return 2
+    if num <= 8:  return 3
+    if num <= 11: return 4
+    return 5
+
+
 class NodeLoadView(APIView):
     """
     UC-LOG-01 — Load micro-lesson and passage.
@@ -37,6 +49,7 @@ class NodeLoadView(APIView):
             'node_id':            node.node_id,
             'title':              node.title,
             'focus':              node.focus,
+            'difficulty':         _node_difficulty(node.node_id),
             'micro_lesson_text':  node.micro_lesson_text,
             'reading_passage':    node.reading_passage,
             'deep_dive_required': node.word_count > 300,
@@ -146,6 +159,21 @@ class MasteryView(APIView):
 
     def post(self, request, node_id):
         student_id = str(request.user.id)
+        commit_only = request.data.get('commit_only', False)
+
+        if commit_only:
+            result = ProgressionManagementService\
+                .update_progression(
+                    student_id=student_id,
+                    node_id=node_id,
+                    username=request.user.email,
+                )
+            return Response({
+                'status':    'mastered',
+                'next_node': result['next_node'],
+                'streak':    result['streak'],
+            })
+
         submitted  = request.data.get('sequence', [])
 
         node = LogicThreadNodeDocument.objects(
@@ -156,6 +184,12 @@ class MasteryView(APIView):
                 status=status.HTTP_404_NOT_FOUND)
 
         if submitted == node.correct_sequence:
+            save_progression = request.data.get('save_progression', True)
+            if not save_progression:
+                return Response({
+                    'status': 'mastered',
+                })
+
             result = ProgressionManagementService\
                 .update_progression(
                     student_id=student_id,
