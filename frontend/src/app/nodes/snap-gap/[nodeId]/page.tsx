@@ -6,6 +6,10 @@ import {
 } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { apiFetch } from '@/lib/api'
+import {
+  buildSessionQueue, saveSession, loadSession, clearSession,
+  nodeDifficulty, DIFFICULTY_LABELS, DIFFICULTY_COLORS,
+} from '@/lib/nodeSession'
 
 // ── Types ─────────────────────────────────────────
 interface SentencePair {
@@ -18,6 +22,7 @@ interface SnapNodeData {
   node_id:              string
   title:                string
   focus:                string
+  difficulty:           number
   micro_lesson_text:    string
   reading_passage:      string
   deep_dive_required:   boolean
@@ -471,20 +476,100 @@ export default function SnapInGapPage() {
   const [tutorialOpen,  setTutorialOpen]  = useState(false)
   const [tutorialStep,  setTutorialStep]  = useState(0)
 
+  // hint overlay state
+  const [hintOverlay,     setHintOverlay]     = useState(false)
+  const [hintOverlayText, setHintOverlayText] = useState('')
+  const [hintOverlayTier, setHintOverlayTier] = useState(0)
+
   const timerRef    = useRef<ReturnType<typeof setInterval> | null>(null)
   const inactiveRef = useRef(0)
 
+  // session state
+  const [sessionQueue,   setSessionQueue]   = useState<string[]>([])
+  const [questionIndex,  setQuestionIndex]  = useState(0)
+  const [sessionStartId, setSessionStartId] = useState<string | null>(null)
+  const [savedNextNode,  setSavedNextNode]  = useState<string | null>(null)
+  const [savedStreak,    setSavedStreak]    = useState<number | null>(null)
+
+  // ── Load a question inline ──────────────────
+  const loadQuestion = useCallback(async (targetNodeId: string) => {
+    setPhase('loading')
+    try {
+      const d = await apiFetch(`/nodes/snap-gap/${targetNodeId}/`)
+      setSnapNode(d)
+      setPairIdx(0)
+      setBoard({})
+      setLocked([])
+      setTileState('idle')
+      setWrongs(0)
+      setFbText('')
+      setHintText('')
+      setHintTier(0)
+      setDrawer(false)
+      setHintOverlay(false)
+      setHintOverlayText('')
+      setHintOverlayTier(0)
+      setPhase('task')
+    } catch (e: any) {
+      setErrorMsg(e?.error ?? 'Failed to load next question.')
+      setPhase('error')
+    }
+  }, [])
+
   // ── load ─────────────────────────────────────────
   useEffect(() => {
-    apiFetch(`/nodes/snap-gap/${nodeId}/`)
-      .then((d: SnapNodeData) => { setSnapNode(d); setPhase('micro_lesson') })
-      .catch((e: any) => {
-        if (e?.status === 401)              { router.push('/auth');      return }
-        if (e?.error === 'Node is locked.') { router.push('/dashboard'); return }
-        setErrorMsg(e?.error ?? 'Failed to load node.')
-        setPhase('error')
-      })
-  }, [nodeId]) // eslint-disable-line
+    const start = nodeId
+    setSessionStartId(start)
+    const saved = loadSession('snap_gap', start)
+
+    if (saved && saved.sessionQueue.length === 5) {
+      setSessionQueue(saved.sessionQueue)
+      setQuestionIndex(saved.questionIndex)
+      if (saved.next_node) setSavedNextNode(saved.next_node)
+      if (saved.streak !== undefined) setSavedStreak(saved.streak)
+
+      const activeId = saved.sessionQueue[saved.questionIndex] ?? start
+      apiFetch(`/nodes/snap-gap/${activeId}/`)
+        .then((d: SnapNodeData) => {
+          setSnapNode(d)
+          setPhase('task')
+        })
+        .catch((e: any) => {
+          if (e?.status === 401)              { router.push('/auth');      return }
+          if (e?.error === 'Node is locked.') { router.push('/dashboard'); return }
+          setErrorMsg(e?.error ?? 'Failed to load node.')
+          setPhase('error')
+        })
+    } else {
+      apiFetch(`/nodes/snap-gap/${start}/`)
+        .then((d: SnapNodeData) => {
+          setSnapNode(d)
+          setPhase('micro_lesson')
+
+          apiFetch('/progression/dashboard/')
+            .then((prog: any) => {
+              const unlocked: string[] = prog.unlocked_nodes ?? []
+              const queue = buildSessionQueue('snap_gap', start, unlocked)
+              setSessionQueue(queue)
+              setQuestionIndex(0)
+              saveSession('snap_gap', start, {
+                sessionQueue: queue,
+                questionIndex: 0,
+              })
+            })
+            .catch(() => {
+              setSessionQueue([start])
+              setQuestionIndex(0)
+            })
+        })
+        .catch((e: any) => {
+          if (e?.status === 401)              { router.push('/auth');      return }
+          if (e?.error === 'Node is locked.') { router.push('/dashboard'); return }
+          setErrorMsg(e?.error ?? 'Failed to load node.')
+          setPhase('error')
+        })
+    }
+  }, [nodeId, router])
 
   useEffect(() => {
     if (phase !== 'task' || nodeId !== 'snp_node_01') return
@@ -497,28 +582,11 @@ export default function SnapInGapPage() {
     setTutorialOpen(true)
   }, [phase, nodeId])
 
-  // ── timer ─────────────────────────────────────────
-  const resetTimer = useCallback(() => {
-    inactiveRef.current = 0
-    if (timerRef.current) clearInterval(timerRef.current)
-    timerRef.current = setInterval(() => {
-      inactiveRef.current += 1
-      if (inactiveRef.current >= 60) {
-        clearInterval(timerRef.current!)
-        callFeedback('', '', true)
-      }
-    }, 1000)
-  }, [nodeId]) // eslint-disable-line
-
-  useEffect(() => {
-    if (phase === 'task') resetTimer()
-    return () => { if (timerRef.current) clearInterval(timerRef.current) }
-  }, [phase]) // eslint-disable-line
-
   // ── feedback ──────────────────────────────────────
   const callFeedback = useCallback(async (pair_id: string, tile: string, inactivity: boolean) => {
+    const activeNodeId = snapNode?.node_id ?? nodeId
     try {
-      const res = await apiFetch(`/nodes/snap-gap/${nodeId}/feedback/`, {
+      const res = await apiFetch(`/nodes/snap-gap/${activeNodeId}/feedback/`, {
         method: 'POST',
         body: JSON.stringify({
           pair_id,
@@ -535,7 +603,47 @@ export default function SnapInGapPage() {
       setHintText('')
       setDrawer(true)
     }
-  }, [nodeId])
+  }, [nodeId, snapNode])
+
+  // ── timer ─────────────────────────────────────────
+  const resetTimer = useCallback(() => {
+    inactiveRef.current = 0
+    if (timerRef.current) clearInterval(timerRef.current)
+    timerRef.current = setInterval(() => {
+      inactiveRef.current += 1
+      if (inactiveRef.current >= 60) {
+        clearInterval(timerRef.current!)
+        callFeedback('', '', true)
+      }
+    }, 1000)
+  }, [callFeedback])
+
+  useEffect(() => {
+    if (phase === 'task') resetTimer()
+    return () => { if (timerRef.current) clearInterval(timerRef.current) }
+  }, [phase, resetTimer])
+
+  // ── fetch hint overlay ────────────────────────────
+  const fetchHint = useCallback(async () => {
+    const activeNodeId = snapNode?.node_id ?? nodeId
+    try {
+      const res = await apiFetch(`/nodes/snap-gap/${activeNodeId}/feedback/`, {
+        method: 'POST',
+        body: JSON.stringify({
+          pair_id: '',
+          selected_tile: '',
+          inactivity_seconds: 61,
+        }),
+      })
+      const text = res.hint || res.explanation || 'Re-read the two sentences and think about how they relate logically.'
+      setHintOverlayText(text)
+      setHintOverlayTier(res.hint_tier ?? 0)
+      setHintOverlay(true)
+    } catch {
+      setHintOverlayText('Re-read the two sentences and think about how they relate logically.')
+      setHintOverlay(true)
+    }
+  }, [nodeId, snapNode])
 
   // ── tile click ────────────────────────────────────
   const handleTile = async (tile: string) => {
@@ -544,7 +652,7 @@ export default function SnapInGapPage() {
     const pair = snapNode.sentence_pairs[pairIdx]
     if (!pair) return
     try {
-      const res = await apiFetch(`/nodes/snap-gap/${nodeId}/evaluate-gap/`, {
+      const res = await apiFetch(`/nodes/snap-gap/${snapNode.node_id}/evaluate-gap/`, {
         method: 'POST',
         body: JSON.stringify({ pair_id: pair.pair_id, selected_tile: tile }),
       })
@@ -558,9 +666,11 @@ export default function SnapInGapPage() {
         }, 900)
       } else {
         setTileState('incorrect')
-        setWrongs(n => n + 1)
+        const nextWrongs = wrongs + 1
+        setWrongs(nextWrongs)
         setTimeout(() => setTileState('idle'), 600)
         await callFeedback(pair.pair_id, tile, false)
+        if (nextWrongs >= 3) fetchHint()
       }
     } catch { setErrorMsg('Evaluation failed.') }
   }
@@ -570,11 +680,55 @@ export default function SnapInGapPage() {
     if (!snapNode || submitting) return
     setSubmitting(true)
     try {
-      const res = await apiFetch(`/nodes/snap-gap/${nodeId}/mastery/`, {
+      const res = await apiFetch(`/nodes/snap-gap/${snapNode.node_id}/mastery/`, {
         method: 'POST',
-        body: JSON.stringify({ board_state: board }),
+        body: JSON.stringify({
+          board_state: board,
+          save_progression: false,
+        }),
       })
-      if (res.status === 'mastered') { setMasteryData(res); setPhase('mastery') }
+      if (res.status === 'mastered') {
+        const nextIdx = questionIndex + 1
+
+        if (nextIdx < sessionQueue.length) {
+          const newNextNode = savedNextNode
+          const newStreak = savedStreak
+
+          if (sessionStartId) {
+            saveSession('snap_gap', sessionStartId, {
+              sessionQueue,
+              questionIndex: nextIdx,
+              next_node: newNextNode || undefined,
+              streak: newStreak !== null ? newStreak : undefined,
+            })
+          }
+          setQuestionIndex(nextIdx)
+          loadQuestion(sessionQueue[nextIdx])
+        } else {
+          let finalRes = res
+          if (sessionStartId) {
+            finalRes = await apiFetch(
+              `/nodes/snap-gap/${sessionStartId}/mastery/`,
+              {
+                method: 'POST',
+                body: JSON.stringify({
+                  commit_only: true,
+                }),
+              },
+            )
+          }
+
+          const newNextNode = savedNextNode || finalRes.next_node
+          const newStreak = savedStreak !== null ? savedStreak : (finalRes.streak ?? null)
+
+          if (sessionStartId) clearSession('snap_gap', sessionStartId)
+          setMasteryData({
+            next_node: newNextNode,
+            streak: newStreak,
+          })
+          setPhase('mastery')
+        }
+      }
     } catch (e: any) {
       setFbText(e?.status === 'incomplete'
         ? 'Some pairs are incorrect. Check and retry.'
@@ -621,7 +775,7 @@ export default function SnapInGapPage() {
           borderRight: '1px solid #1a1a1a',
         }}>
           <button
-            onClick={() => callFeedback(currentPair?.pair_id ?? '', '', false)}
+            onClick={() => fetchHint()}
             style={{
               writingMode: 'vertical-rl', transform: 'rotate(180deg)',
               fontSize: 11, fontWeight: 700, letterSpacing: '0.14em',
@@ -634,7 +788,17 @@ export default function SnapInGapPage() {
             HINT
           </button>
           <button
-            onClick={() => router.push('/dashboard')}
+            onClick={() => {
+              if (sessionStartId && sessionQueue.length > 0) {
+                saveSession('snap_gap', sessionStartId, {
+                  sessionQueue,
+                  questionIndex,
+                  next_node: savedNextNode || undefined,
+                  streak: savedStreak !== null ? savedStreak : undefined,
+                })
+              }
+              router.push('/dashboard')
+            }}
             style={{
               writingMode: 'vertical-rl', transform: 'rotate(180deg)',
               fontSize: 11, fontWeight: 700, letterSpacing: '0.14em',
@@ -669,8 +833,35 @@ export default function SnapInGapPage() {
             </div>
           </div>
 
+          {/* difficulty badge + Q counter */}
+          <div style={{ padding: '6px 24px 6px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: DIFFICULTY_COLORS[snapNode!.difficulty ?? nodeDifficulty(nodeId)], flexShrink: 0 }} />
+                <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.12em', color: DIFFICULTY_COLORS[snapNode!.difficulty ?? nodeDifficulty(nodeId)], fontFamily: F }}>
+                  LVL {snapNode!.difficulty ?? nodeDifficulty(nodeId)} — {DIFFICULTY_LABELS[snapNode!.difficulty ?? nodeDifficulty(nodeId)]}
+                </span>
+              </div>
+              {sessionQueue.length > 0 && (
+                <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.1em', color: '#555', fontFamily: F }}>
+                  Q {questionIndex + 1} / {sessionQueue.length}
+                </span>
+              )}
+            </div>
+            {sessionQueue.length > 0 && (
+              <div style={{ height: 6, background: '#e0ddd8', borderRadius: 3, overflow: 'hidden', position: 'relative', border: '1px solid #aaa' }}>
+                <div style={{
+                  height: '100%',
+                  width: `${(questionIndex / sessionQueue.length) * 100}%`,
+                  background: '#2b2b2b',
+                  transition: 'width 0.3s ease-in-out'
+                }} />
+              </div>
+            )}
+          </div>
+
           {/* progress dots */}
-          <div style={{ padding: '6px 24px 4px', display: 'flex', gap: 8, justifyContent: 'center' }}>
+          <div style={{ padding: '4px 24px 4px', display: 'flex', gap: 8, justifyContent: 'center' }}>
             {snapNode!.sentence_pairs.map((p, i) => (
               <div key={p.pair_id} style={{
                 width: 34, height: 8, borderRadius: 4,
@@ -818,6 +1009,54 @@ export default function SnapInGapPage() {
         onNext={nextTutorialStep}
         onStart={() => setTutorialOpen(false)}
       />
+
+      {/* hint overlay */}
+      {hintOverlay && (
+        <div style={{
+          position: 'fixed', inset: 0,
+          background: 'rgba(0,0,0,0.45)',
+          zIndex: 100,
+          display: 'flex',
+          alignItems: 'flex-start',
+          justifyContent: 'flex-start',
+          padding: 24,
+          pointerEvents: 'none',
+        }}>
+          <div style={{
+            background: '#fff',
+            border: '2px solid #ddd',
+            borderRadius: 5,
+            padding: '16px 18px 14px',
+            maxWidth: 260,
+            boxShadow: '0 6px 24px rgba(0,0,0,0.35)',
+            pointerEvents: 'all',
+          }}>
+            <div style={{
+              fontSize: 9, fontWeight: 700, letterSpacing: '0.14em',
+              color: '#888', marginBottom: 8, fontFamily: F,
+            }}>
+              SCAFFOLD HINT{hintOverlayTier > 0 ? ` — TIER ${hintOverlayTier}` : ''}
+            </div>
+            <p style={{
+              fontSize: 12, color: '#222', lineHeight: 1.65,
+              margin: '0 0 14px', fontFamily: F,
+            }}>
+              {hintOverlayText}
+            </p>
+            <button
+              onClick={() => setHintOverlay(false)}
+              style={{
+                fontSize: 10, fontWeight: 700, color: '#444',
+                background: '#eee', border: '1px solid #ccc',
+                padding: '5px 14px', cursor: 'pointer',
+                fontFamily: F, letterSpacing: '0.06em', borderRadius: 2,
+              }}
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* feedback drawer */}
       {drawer && (

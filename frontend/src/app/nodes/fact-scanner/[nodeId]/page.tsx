@@ -6,6 +6,10 @@ import {
 } from 'react'
 import { useRouter, useParams } from 'next/navigation'
 import { apiFetch } from '@/lib/api'
+import {
+  buildSessionQueue, saveSession, loadSession, clearSession,
+  nodeDifficulty, DIFFICULTY_LABELS, DIFFICULTY_COLORS,
+} from '@/lib/nodeSession'
 
 // ── Types ───────────────────────────────────────
 interface ArticleSentence {
@@ -21,6 +25,7 @@ interface FactNodeData {
   micro_lesson_text:   string
   reading_passage:     string
   deep_dive_required:  boolean
+  difficulty:          number
   article_sentences:   ArticleSentence[]
 }
 
@@ -382,6 +387,13 @@ export default function FactScannerPage() {
   const [factNode, setFactNode] = useState<FactNodeData | null>(null)
   const [errorMsg, setErrorMsg] = useState('')
 
+  // session state
+  const [sessionQueue,    setSessionQueue]    = useState<string[]>([])
+  const [questionIndex,   setQuestionIndex]   = useState(0)
+  const [sessionStartId,  setSessionStartId]  = useState<string | null>(null)
+  const [savedNextNode,   setSavedNextNode]   = useState<string | null>(null)
+  const [savedStreak,     setSavedStreak]     = useState<number | null>(null)
+
   // task state
   const [quarantined, setQuarantined]   = useState<string[]>([])
   const [flawReasons, setFlawReasons]   = useState<Record<string, string>>({})
@@ -407,20 +419,82 @@ export default function FactScannerPage() {
   const timerRef    = useRef<ReturnType<typeof setInterval> | null>(null)
   const inactiveRef = useRef(0)
 
-  // ── Load ───────────────────────────────────
+  // ── Load a question inline ──────────────────
+  const loadQuestion = useCallback(async (targetNodeId: string) => {
+    setPhase('loading')
+    try {
+      const d = await apiFetch(`/nodes/fact-scanner/${targetNodeId}/`)
+      setFactNode(d)
+      setQuarantined([])
+      setFlawReasons({})
+      setEvaluating(null)
+      setWrongs(0)
+      setFbText('')
+      setDrawer(false)
+      setHintOverlay(false)
+      setHintOverlayText('')
+      setHintOverlayTier(0)
+      setPhase('task')
+    } catch (e: any) {
+      setErrorMsg(e?.error ?? 'Failed to load next question.')
+      setPhase('error')
+    }
+  }, [])
+
+  // ── Load + session init ────────────────────
   useEffect(() => {
-    apiFetch(`/nodes/fact-scanner/${nodeId}/`)
-      .then((d: FactNodeData) => {
-        setFactNode(d)
-        setPhase('micro_lesson')
-      })
-      .catch((e) => {
-        if ((e as any)?.status === 401)               { router.push('/auth');      return }
-        if ((e as any)?.error === 'Node is locked.')  { router.push('/dashboard'); return }
-        setErrorMsg((e as any)?.error ?? 'Failed to load node.')
-        setPhase('error')
-      })
-  }, [nodeId]) // eslint-disable-line
+    const start = nodeId
+    setSessionStartId(start)
+    const saved = loadSession('fact_scanner', start)
+
+    if (saved && saved.sessionQueue.length === 5) {
+      setSessionQueue(saved.sessionQueue)
+      setQuestionIndex(saved.questionIndex)
+      if (saved.next_node) setSavedNextNode(saved.next_node)
+      if (saved.streak !== undefined) setSavedStreak(saved.streak)
+      
+      const activeId = saved.sessionQueue[saved.questionIndex] ?? start
+      apiFetch(`/nodes/fact-scanner/${activeId}/`)
+        .then((d: FactNodeData) => {
+          setFactNode(d)
+          setPhase('task')
+        })
+        .catch((e: any) => {
+          if (e?.status === 401)               { router.push('/auth');      return }
+          if (e?.error === 'Node is locked.')  { router.push('/dashboard'); return }
+          setErrorMsg(e?.error ?? 'Failed to load node.')
+          setPhase('error')
+        })
+    } else {
+      apiFetch(`/nodes/fact-scanner/${start}/`)
+        .then((d: FactNodeData) => {
+          setFactNode(d)
+          setPhase('micro_lesson')
+          
+          apiFetch('/progression/dashboard/')
+            .then((prog: any) => {
+              const unlocked: string[] = prog.unlocked_nodes ?? []
+              const queue = buildSessionQueue('fact_scanner', start, unlocked)
+              setSessionQueue(queue)
+              setQuestionIndex(0)
+              saveSession('fact_scanner', start, {
+                sessionQueue: queue,
+                questionIndex: 0,
+              })
+            })
+            .catch(() => {
+              setSessionQueue([start])
+              setQuestionIndex(0)
+            })
+        })
+        .catch((e: any) => {
+          if (e?.status === 401)               { router.push('/auth');      return }
+          if (e?.error === 'Node is locked.')  { router.push('/dashboard'); return }
+          setErrorMsg(e?.error ?? 'Failed to load node.')
+          setPhase('error')
+        })
+    }
+  }, [nodeId, router])
 
   useEffect(() => {
     if (phase !== 'task') return
@@ -435,9 +509,10 @@ export default function FactScannerPage() {
   const fetchHint = useCallback(async (
     isInactivity = false,
   ) => {
+    const activeNodeId = factNode?.node_id ?? nodeId
     try {
       const res = await apiFetch(
-        `/nodes/fact-scanner/${nodeId}/feedback/`,
+        `/nodes/fact-scanner/${activeNodeId}/feedback/`,
         {
           method: 'POST',
           body: JSON.stringify({
@@ -457,7 +532,7 @@ export default function FactScannerPage() {
         'Re-read the micro-lesson and apply the criterion to each sentence carefully.')
       setHintOverlay(true)
     }
-  }, [nodeId])
+  }, [nodeId, factNode])
 
   // ── Timer ──────────────────────────────────
   const resetTimer = useCallback(() => {
@@ -470,21 +545,22 @@ export default function FactScannerPage() {
         fetchHint(true)
       }
     }, 1000)
-  }, [nodeId]) // eslint-disable-line
+  }, [fetchHint])
 
   useEffect(() => {
     if (phase === 'task') resetTimer()
     return () => { if (timerRef.current) clearInterval(timerRef.current) }
-  }, [phase]) // eslint-disable-line
+  }, [phase, resetTimer])
 
   // ── Feedback ───────────────────────────────
   const callFeedback = useCallback(async (
     sentence_id: string,
     inactivity:  boolean,
   ) => {
+    const activeNodeId = factNode?.node_id ?? nodeId
     try {
       const res = await apiFetch(
-        `/nodes/fact-scanner/${nodeId}/feedback/`,
+        `/nodes/fact-scanner/${activeNodeId}/feedback/`,
         {
           method: 'POST',
           body: JSON.stringify({
@@ -499,10 +575,7 @@ export default function FactScannerPage() {
       setFbText('That sentence does not violate the CRAAP criterion. Re-read the micro-lesson.')
       setDrawer(true)
     }
-  }, [nodeId])
-
-  // ── Hint ───────────────────────────────────
-  
+  }, [nodeId, factNode])
 
   // ── Sentence tap ───────────────────────────
   const handleSentenceTap = async (
@@ -518,7 +591,7 @@ export default function FactScannerPage() {
 
     try {
       const res = await apiFetch(
-        `/nodes/fact-scanner/${nodeId}/evaluate-sentence/`,
+        `/nodes/fact-scanner/${factNode.node_id}/evaluate-sentence/`,
         {
           method: 'POST',
           body: JSON.stringify({ sentence_id }),
@@ -532,8 +605,10 @@ export default function FactScannerPage() {
           [sentence_id]: res.flaw_reason,
         }))
       } else {
-        setWrongs(n => n + 1)
+        const nextWrongs = wrongs + 1
+        setWrongs(nextWrongs)
         await callFeedback(sentence_id, false)
+        if (nextWrongs >= 3) fetchHint()
       }
     } catch {
       setErrorMsg('Evaluation failed.')
@@ -548,17 +623,56 @@ export default function FactScannerPage() {
     setSubmitting(true)
     try {
       const res = await apiFetch(
-        `/nodes/fact-scanner/${nodeId}/mastery/`,
+        `/nodes/fact-scanner/${factNode.node_id}/mastery/`,
         {
           method: 'POST',
           body: JSON.stringify({
             quarantined_ids: quarantined,
+            save_progression: false,
           }),
         },
       )
       if (res.status === 'mastered') {
-        setMasteryData(res)
-        setPhase('mastery')
+        const nextIdx = questionIndex + 1
+
+        if (nextIdx < sessionQueue.length) {
+          const newNextNode = savedNextNode
+          const newStreak = savedStreak
+
+          if (sessionStartId) {
+            saveSession('fact_scanner', sessionStartId, {
+              sessionQueue,
+              questionIndex: nextIdx,
+              next_node: newNextNode || undefined,
+              streak: newStreak !== null ? newStreak : undefined,
+            })
+          }
+          setQuestionIndex(nextIdx)
+          loadQuestion(sessionQueue[nextIdx])
+        } else {
+          let finalRes = res
+          if (sessionStartId) {
+            finalRes = await apiFetch(
+              `/nodes/fact-scanner/${sessionStartId}/mastery/`,
+              {
+                method: 'POST',
+                body: JSON.stringify({
+                  commit_only: true,
+                }),
+              },
+            )
+          }
+
+          const newNextNode = savedNextNode || finalRes.next_node
+          const newStreak = savedStreak !== null ? savedStreak : (finalRes.streak ?? null)
+
+          if (sessionStartId) clearSession('fact_scanner', sessionStartId)
+          setMasteryData({
+            next_node: newNextNode,
+            streak: newStreak,
+          })
+          setPhase('mastery')
+        }
       }
     } catch (e) {
       setFbText(
@@ -775,14 +889,14 @@ export default function FactScannerPage() {
             fontSize: 12, color: '#aaa',
             margin: '0 0 28px', fontFamily: F,
           }}>
-            Streak: {masteryData?.streak ?? 0} days
+            Streak: {String(masteryData?.streak ?? 0)} days
           </p>
           <div style={{
             display: 'flex', gap: 12,
             justifyContent: 'center',
             flexWrap: 'wrap',
           }}>
-            {masteryData?.next_node && (
+            {!!masteryData?.next_node && (
               <button
                 style={S.btnPrimary}
                 onClick={() =>
@@ -858,7 +972,18 @@ export default function FactScannerPage() {
             HINT
           </button>
           <button
-            onClick={() => router.push('/dashboard')}
+            onClick={() => {
+              // Save progress before leaving
+              if (sessionStartId && sessionQueue.length > 0) {
+                saveSession('fact_scanner', sessionStartId, {
+                  sessionQueue,
+                  questionIndex,
+                  next_node: savedNextNode || undefined,
+                  streak: savedStreak !== null ? savedStreak : undefined,
+                })
+              }
+              router.push('/dashboard')
+            }}
             style={{
               writingMode: 'vertical-rl',
               transform: 'rotate(180deg)',
@@ -921,6 +1046,54 @@ export default function FactScannerPage() {
                 {factNode!.craap_criterion}
               </span>
             </div>
+          </div>
+
+          {/* difficulty badge + question counter */}
+          <div style={{
+            padding: '6px 24px 6px',
+            display: 'flex', flexDirection: 'column', gap: 6,
+          }}>
+            <div style={{
+              display: 'flex', alignItems: 'center',
+              justifyContent: 'space-between',
+            }}>
+              {/* difficulty badge */}
+              <div style={{
+                display: 'flex', alignItems: 'center', gap: 6,
+              }}>
+                <div style={{
+                  width: 8, height: 8, borderRadius: '50%',
+                  background: DIFFICULTY_COLORS[factNode!.difficulty ?? nodeDifficulty(nodeId)],
+                  flexShrink: 0,
+                }} />
+                <span style={{
+                  fontSize: 9, fontWeight: 700, letterSpacing: '0.12em',
+                  color: DIFFICULTY_COLORS[factNode!.difficulty ?? nodeDifficulty(nodeId)],
+                  fontFamily: F,
+                }}>
+                  LVL {factNode!.difficulty ?? nodeDifficulty(nodeId)} — {DIFFICULTY_LABELS[factNode!.difficulty ?? nodeDifficulty(nodeId)]}
+                </span>
+              </div>
+              {/* question counter */}
+              {sessionQueue.length > 0 && (
+                <span style={{
+                  fontSize: 9, fontWeight: 700, letterSpacing: '0.1em',
+                  color: '#555', fontFamily: F,
+                }}>
+                  Q {questionIndex + 1} / {sessionQueue.length}
+                </span>
+              )}
+            </div>
+            {sessionQueue.length > 0 && (
+              <div style={{ height: 6, background: '#e0ddd8', borderRadius: 3, overflow: 'hidden', position: 'relative', border: '1px solid #aaa' }}>
+                <div style={{
+                  height: '100%',
+                  width: `${(questionIndex / sessionQueue.length) * 100}%`,
+                  background: '#2b2b2b',
+                  transition: 'width 0.3s ease-in-out'
+                }} />
+              </div>
+            )}
           </div>
 
           <div style={{ padding: '0 24px 4px', display: 'flex', justifyContent: 'flex-end' }}>

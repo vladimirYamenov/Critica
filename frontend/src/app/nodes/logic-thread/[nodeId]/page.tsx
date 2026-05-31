@@ -3,6 +3,10 @@
 import { useEffect, useState, useCallback } from 'react'
 import { useRouter, useParams }             from 'next/navigation'
 import { apiFetch }                          from '@/lib/api'
+import {
+  buildSessionQueue, saveSession, loadSession, clearSession,
+  nodeDifficulty, DIFFICULTY_LABELS, DIFFICULTY_COLORS,
+} from '@/lib/nodeSession'
 
 // ── Types ────────────────────────────────────────────────────
 interface Block { block_id: string; text: string }
@@ -10,6 +14,7 @@ interface NodeData {
   node_id:            string
   title:              string
   focus:              string
+  difficulty:         number
   micro_lesson_text:  string
   reading_passage:    string
   deep_dive_required: boolean
@@ -459,21 +464,88 @@ export default function LogicThreadPage() {
   const [tutorialOpen, setTutorialOpen] = useState(false)
   const [tutorialStep, setTutorialStep] = useState(0)
 
+  // session state
+  const [sessionQueue,   setSessionQueue]   = useState<string[]>([])
+  const [questionIndex,  setQuestionIndex]  = useState(0)
+  const [sessionStartId, setSessionStartId] = useState<string | null>(null)
+  const [savedNextNode,  setSavedNextNode]  = useState<string | null>(null)
+  const [savedStreak,    setSavedStreak]    = useState<number | null>(null)
+
+  // ── Load a question inline ──────────────────
+  const loadQuestion = useCallback(async (targetNodeId: string) => {
+    setPhase('loading')
+    try {
+      const d = await apiFetch(`/nodes/logic-thread/${targetNodeId}/`)
+      setNode(d)
+      setBlocks([...d.paragraph_blocks].sort(() => Math.random() - 0.5))
+      setChain([])
+      setSubmitState('idle')
+      setWrongCount(0)
+      setShowHint(false)
+      setHintText('')
+      setPhase('task')
+    } catch (e: any) {
+      setErrorMsg(e?.error ?? 'Failed to load next question.')
+      setPhase('error')
+    }
+  }, [])
+
   // ── Load node ──────────────────────────────────────────────
   useEffect(() => {
-    apiFetch(`/nodes/logic-thread/${nodeId}/`)
-      .then((d: NodeData) => {
-        setNode(d)
-        setBlocks([...d.paragraph_blocks].sort(() => Math.random() - 0.5))
-        setPhase('micro_lesson')
-      })
-      .catch((e: any) => {
-        if (e?.status === 401)             { router.push('/auth');      return }
-        if (e?.error === 'Node is locked.'){ router.push('/dashboard'); return }
-        setErrorMsg(e?.error ?? 'Failed to load node.')
-        setPhase('error')
-      })
-  }, [nodeId])
+    const start = nodeId
+    setSessionStartId(start)
+    const saved = loadSession('logic_thread', start)
+
+    if (saved && saved.sessionQueue.length === 5) {
+      setSessionQueue(saved.sessionQueue)
+      setQuestionIndex(saved.questionIndex)
+      if (saved.next_node) setSavedNextNode(saved.next_node)
+      if (saved.streak !== undefined) setSavedStreak(saved.streak)
+      
+      const activeId = saved.sessionQueue[saved.questionIndex] ?? start
+      apiFetch(`/nodes/logic-thread/${activeId}/`)
+        .then((d: NodeData) => {
+          setNode(d)
+          setBlocks([...d.paragraph_blocks].sort(() => Math.random() - 0.5))
+          setPhase('task')
+        })
+        .catch((e: any) => {
+          if (e?.status === 401)             { router.push('/auth');      return }
+          if (e?.error === 'Node is locked.'){ router.push('/dashboard'); return }
+          setErrorMsg(e?.error ?? 'Failed to load node.')
+          setPhase('error')
+        })
+    } else {
+      apiFetch(`/nodes/logic-thread/${start}/`)
+        .then((d: NodeData) => {
+          setNode(d)
+          setBlocks([...d.paragraph_blocks].sort(() => Math.random() - 0.5))
+          setPhase('micro_lesson')
+          
+          apiFetch('/progression/dashboard/')
+            .then((prog: any) => {
+              const unlocked: string[] = prog.unlocked_nodes ?? []
+              const queue = buildSessionQueue('logic_thread', start, unlocked)
+              setSessionQueue(queue)
+              setQuestionIndex(0)
+              saveSession('logic_thread', start, {
+                sessionQueue: queue,
+                questionIndex: 0,
+              })
+            })
+            .catch(() => {
+              setSessionQueue([start])
+              setQuestionIndex(0)
+            })
+        })
+        .catch((e: any) => {
+          if (e?.status === 401)             { router.push('/auth');      return }
+          if (e?.error === 'Node is locked.'){ router.push('/dashboard'); return }
+          setErrorMsg(e?.error ?? 'Failed to load node.')
+          setPhase('error')
+        })
+    }
+  }, [nodeId, router])
 
   useEffect(() => {
     if (phase !== 'task' || nodeId !== 'log_node_01') return
@@ -488,8 +560,9 @@ export default function LogicThreadPage() {
 
   // ── Fetch hint ─────────────────────────────────────────────
   const fetchHint = useCallback(async (tier: number) => {
+    const activeNodeId = node?.node_id ?? nodeId
     try {
-      const res = await apiFetch(`/nodes/logic-thread/${nodeId}/feedback/`, {
+      const res = await apiFetch(`/nodes/logic-thread/${activeNodeId}/feedback/`, {
         method: 'POST',
         body: JSON.stringify({ source_id: '', target_id: '', inactivity_seconds: 61 }),
       })
@@ -498,7 +571,7 @@ export default function LogicThreadPage() {
       setHintText('Try re-reading the passage and look for signal words.')
     }
     setShowHint(true)
-  }, [nodeId])
+  }, [nodeId, node])
 
   // ── Card click ─────────────────────────────────────────────
   const handleCardClick = (blockId: string) => {
@@ -516,14 +589,61 @@ export default function LogicThreadPage() {
     if (chain.length !== blocks.length)  return
     setSubmitState('submitting')
     try {
-      const res = await apiFetch(`/nodes/logic-thread/${nodeId}/mastery/`, {
+      const res = await apiFetch(`/nodes/logic-thread/${node.node_id}/mastery/`, {
         method: 'POST',
-        body: JSON.stringify({ sequence: chain }),
+        body: JSON.stringify({
+          sequence: chain,
+          save_progression: false,
+        }),
       })
       if (res.status === 'mastered') {
         setSubmitState('correct')
-        setMasteryData(res)
-        setTimeout(() => setPhase('mastery'), 2000)
+        
+        const nextIdx = questionIndex + 1
+
+        setTimeout(async () => {
+          try {
+            if (nextIdx < sessionQueue.length) {
+              const newNextNode = savedNextNode
+              const newStreak = savedStreak
+
+              if (sessionStartId) {
+                saveSession('logic_thread', sessionStartId, {
+                  sessionQueue,
+                  questionIndex: nextIdx,
+                  next_node: newNextNode || undefined,
+                  streak: newStreak !== null ? newStreak : undefined,
+                })
+              }
+              setQuestionIndex(nextIdx)
+              loadQuestion(sessionQueue[nextIdx])
+            } else {
+              let finalRes = res
+              if (sessionStartId) {
+                finalRes = await apiFetch(
+                  `/nodes/logic-thread/${sessionStartId}/mastery/`,
+                  {
+                    method: 'POST',
+                    body: JSON.stringify({
+                      commit_only: true,
+                    }),
+                  },
+                )
+              }
+              const newNextNode = savedNextNode || finalRes.next_node
+              const newStreak = savedStreak !== null ? savedStreak : (finalRes.streak ?? null)
+
+              if (sessionStartId) clearSession('logic_thread', sessionStartId)
+              setMasteryData({
+                next_node: newNextNode,
+                streak: newStreak,
+              })
+              setPhase('mastery')
+            }
+          } catch {
+            setSubmitState('idle')
+          }
+        }, 2000)
       }
     } catch {
       const next = wrongCount + 1
@@ -610,7 +730,17 @@ export default function LogicThreadPage() {
           </button>
           <button
             title="End session"
-            onClick={() => router.push('/dashboard')}
+            onClick={() => {
+              if (sessionStartId && sessionQueue.length > 0) {
+                saveSession('logic_thread', sessionStartId, {
+                  sessionQueue,
+                  questionIndex,
+                  next_node: savedNextNode || undefined,
+                  streak: savedStreak !== null ? savedStreak : undefined,
+                })
+              }
+              router.push('/dashboard')
+            }}
             style={{
               writingMode: 'vertical-rl', transform: 'rotate(180deg)',
               fontSize: 14, fontWeight: 700, letterSpacing: '0.14em',
@@ -648,6 +778,33 @@ export default function LogicThreadPage() {
                 CONNECT THE PARAGRAPHS TO FORM ITS OVERALL MEANING
               </span>
             </div>
+          </div>
+
+          {/* difficulty badge + Q counter */}
+          <div style={{ padding: '6px 20px 6px', display: 'flex', flexDirection: 'column', gap: 6 }}>
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ width: 8, height: 8, borderRadius: '50%', background: DIFFICULTY_COLORS[node!.difficulty ?? nodeDifficulty(nodeId)], flexShrink: 0 }} />
+                <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.12em', color: DIFFICULTY_COLORS[node!.difficulty ?? nodeDifficulty(nodeId)], fontFamily: FONT }}>
+                  LVL {node!.difficulty ?? nodeDifficulty(nodeId)} — {DIFFICULTY_LABELS[node!.difficulty ?? nodeDifficulty(nodeId)]}
+                </span>
+              </div>
+              {sessionQueue.length > 0 && (
+                <span style={{ fontSize: 9, fontWeight: 700, letterSpacing: '0.1em', color: '#555', fontFamily: FONT }}>
+                  Q {questionIndex + 1} / {sessionQueue.length}
+                </span>
+              )}
+            </div>
+            {sessionQueue.length > 0 && (
+              <div style={{ height: 6, background: '#e0ddd8', borderRadius: 3, overflow: 'hidden', position: 'relative', border: '1px solid #aaa' }}>
+                <div style={{
+                  height: '100%',
+                  width: `${((questionIndex + (submitState === 'correct' ? 1 : 0)) / sessionQueue.length) * 100}%`,
+                  background: '#2b2b2b',
+                  transition: 'width 0.3s ease-in-out'
+                }} />
+              </div>
+            )}
           </div>
 
           {/* Canvas */}

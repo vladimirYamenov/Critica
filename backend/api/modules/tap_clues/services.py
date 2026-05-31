@@ -1,6 +1,19 @@
 # backend/api/modules/tap_clues/services.py
 from .mongo_models import VocabularyNodeDocument
 
+
+def _node_difficulty(node_id: str) -> int:
+    try:
+        num = int(node_id.split('_')[-1])
+    except (ValueError, IndexError):
+        return 1
+    if num <= 2:  return 1
+    if num <= 5:  return 2
+    if num <= 8:  return 3
+    if num <= 11: return 4
+    return 5
+
+
 class ContentManagementService:
 
     @staticmethod
@@ -20,6 +33,7 @@ class ContentManagementService:
             'node_id':   node.node_id,
             'title':     node.title,
             'focus':     node.focus,
+            'difficulty': _node_difficulty(node.node_id),
             'micro_lesson_text':
                          node.micro_lesson_text,
             'reading_passage':

@@ -84,4 +84,23 @@ class ModuleNodesView(APIView):
             'module_key': module_key,
             'nodes':      nodes,
         })
+
+
+class NodeResetView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        student_id = str(request.user.id)
+        node_id    = request.data.get('node_id')
+        if not node_id:
+            return Response(
+                {'error': 'node_id is required.'},
+                status=400)
+
+        profile = ProgressionManagementService.reset_node(
+            student_id, node_id)
+        return Response({
+            'status':          'reset',
+            'completed_nodes': profile.completed_nodes,
+        })
     

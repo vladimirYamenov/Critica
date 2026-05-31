@@ -1,6 +1,20 @@
 # backend/api/modules/fact_scanner/services.py
 from .mongo_models import ArticleDocument
 
+
+def _node_difficulty(node_id: str) -> int:
+    """Derive difficulty tier 1-5 from node_id suffix."""
+    try:
+        num = int(node_id.split('_')[-1])
+    except (ValueError, IndexError):
+        return 1
+    if num <= 2:  return 1
+    if num <= 5:  return 2
+    if num <= 8:  return 3
+    if num <= 11: return 4
+    return 5
+
+
 class ContentManagementService:
 
     @staticmethod
@@ -24,6 +38,7 @@ class ContentManagementService:
             'micro_lesson_text':
                               node.micro_lesson_text,
             'reading_passage':node.reading_passage,
+            'difficulty':     _node_difficulty(node.node_id),
             'deep_dive_required':
                 ContentManagementService
                 .check_deep_dive_required(

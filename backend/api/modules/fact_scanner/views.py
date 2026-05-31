@@ -122,6 +122,21 @@ class MasteryView(APIView):
 
     def post(self, request, node_id):
         student_id      = str(request.user.id)
+        commit_only     = request.data.get('commit_only', False)
+
+        if commit_only:
+            result = ProgressionManagementService\
+                .update_progression(
+                    student_id=student_id,
+                    node_id=node_id,
+                    username=request.user.email,
+                )
+            return Response({
+                'status':    'mastered',
+                'next_node': result['next_node'],
+                'streak':    result['streak'],
+            })
+
         quarantined_ids = request.data.get(
             'quarantined_ids', [])
 
@@ -139,6 +154,12 @@ class MasteryView(APIView):
         ]
 
         if not remaining:
+            save_progression = request.data.get('save_progression', True)
+            if not save_progression:
+                return Response({
+                    'status': 'mastered',
+                })
+
             result = ProgressionManagementService\
                 .update_progression(
                     student_id=student_id,
